@@ -1,0 +1,13 @@
+{
+  "name": "lily-github-mcp-bridge",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Self-hosted MCP server giving Claude read/write access to specific GitHub repos via a PAT.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
