@@ -6,7 +6,7 @@
  * (PAT) that you control. Built because Anthropic's built-in GitHub
  * connector is read-only for repo contents.
  *
- * - No npm dependencies: uses only Node's built-in http/https/crypto.
+ * - No npm dependencies: uses only Node's built-in http/https/crypto/fs.
  * - OAuth 2.0 (authorization-code style) in front of the MCP endpoint,
  *   gated by an admin secret (MCP_ADMIN_SECRET) you set as an env var.
  *   This satisfies Claude.ai's requirement that custom connectors use OAuth.
@@ -17,8 +17,11 @@
  *   Claude / Anthropic infrastructure. It's used only for outbound calls to
  *   api.github.com.
  * - Repo access is restricted to ALLOWED_REPOS (comma-separated "owner/repo"
- *   list) so the bridge can't touch anything beyond what you intend, even if
- *   the PAT itself has broader scope.
+ *   list, with "owner/*" and "*" wildcards supported) so the bridge can't
+ *   touch anything beyond what you intend, even if the PAT itself has
+ *   broader scope.
+ * - GET /status.html serves a small static status page (no auth required,
+ *   read-only, doesn't expose repo contents) that pings /health.
  *
  * Required env vars:
  *   GITHUB_TOKEN     - a GitHub PAT (fine-grained, scoped narrowly is best)
@@ -27,7 +30,9 @@
  *   MCP_BASE_URL     - the public HTTPS URL this server is reachable at,
  *                      e.g. https://your-domain.com  (no trailing slash)
  *   ALLOWED_REPOS    - comma-separated "owner/repo" list, e.g.
- *                      "UmakraftCircle/DmLilyAi"
+ *                      "UmakraftCircle/DmLilyAi". Also accepts "owner/*"
+ *                      (every repo under that owner) or "*" (every repo the
+ *                      token can reach).
  *
  * Optional env vars:
  *   MCP_JWT_SECRET   - a separate long random string used to sign tokens and
@@ -49,6 +54,8 @@
 const http = require('http');
 const https = require('https');
 const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
 const { URL } = require('url');
 
 // ---------------------------------------------------------------------------
@@ -93,6 +100,17 @@ if (!process.env.MCP_JWT_SECRET) {
 // In-memory store for OAuth authorization codes (short-lived, single-use).
 // Fine for a single-instance bridge server; not meant to scale horizontally.
 const pendingCodes = new Map(); // code -> { expiresAt, codeChallenge, codeChallengeMethod, clientId }
+
+// ---------------------------------------------------------------------------
+// Static status page (read-only, no auth, doesn't expose repo contents)
+// ---------------------------------------------------------------------------
+
+let STATUS_HTML = null;
+try {
+  STATUS_HTML = fs.readFileSync(path.join(__dirname, 'status.html'), 'utf8');
+} catch (e) {
+  console.warn('WARN: status.html not found next to server.js; /status.html will 404.');
+}
 
 // ---------------------------------------------------------------------------
 // Small crypto helpers
@@ -323,8 +341,8 @@ function assertRepoAllowed(owner, repo) {
 // is encoded on its own so "/" separators are preserved (encoding the whole
 // path would turn "src/foo.js" into "src%2Ffoo.js", which GitHub rejects).
 // Leading/trailing slashes are stripped; an empty path means the repo root.
-function encodePath(path) {
-  return String(path || '')
+function encodePath(p) {
+  return String(p || '')
     .split('/')
     .filter(Boolean)
     .map(encodeURIComponent)
@@ -350,16 +368,16 @@ const TOOLS = [
       },
       required: ['owner', 'repo', 'path'],
     },
-    handler: async ({ owner, repo, path, ref }) => {
+    handler: async ({ owner, repo, path: p, ref }) => {
       assertRepoAllowed(owner, repo);
       const q = ref ? `?ref=${encodeURIComponent(ref)}` : '';
-      const res = await githubRequest('GET', `/repos/${owner}/${repo}/contents/${encodePath(path)}${q}`);
+      const res = await githubRequest('GET', `/repos/${owner}/${repo}/contents/${encodePath(p)}${q}`);
       if (res.status >= 400) throw new Error(`GitHub error ${res.status}: ${JSON.stringify(res.body)}`);
 
       // Directory: GitHub returns an array of entries.
       if (Array.isArray(res.body)) {
         return {
-          path: path || '/',
+          path: p || '/',
           type: 'dir',
           entries: res.body.map((e) => ({
             name: e.name,
@@ -391,7 +409,7 @@ const TOOLS = [
       },
       required: ['owner', 'repo', 'path', 'content', 'message', 'branch'],
     },
-    handler: async ({ owner, repo, path, content, message, branch, sha }) => {
+    handler: async ({ owner, repo, path: p, content, message, branch, sha }) => {
       assertRepoAllowed(owner, repo);
       const body = {
         message,
@@ -399,9 +417,9 @@ const TOOLS = [
         content: Buffer.from(content, 'utf8').toString('base64'),
         ...(sha ? { sha } : {}),
       };
-      const res = await githubRequest('PUT', `/repos/${owner}/${repo}/contents/${encodePath(path)}`, body);
+      const res = await githubRequest('PUT', `/repos/${owner}/${repo}/contents/${encodePath(p)}`, body);
       if (res.status >= 400) throw new Error(`GitHub error ${res.status}: ${JSON.stringify(res.body)}`);
-      return { commit: res.body.commit && res.body.commit.sha, path };
+      return { commit: res.body.commit && res.body.commit.sha, path: p };
     },
   },
   {
@@ -419,15 +437,15 @@ const TOOLS = [
       },
       required: ['owner', 'repo', 'path', 'message', 'branch', 'sha'],
     },
-    handler: async ({ owner, repo, path, message, branch, sha }) => {
+    handler: async ({ owner, repo, path: p, message, branch, sha }) => {
       assertRepoAllowed(owner, repo);
-      const res = await githubRequest('DELETE', `/repos/${owner}/${repo}/contents/${encodePath(path)}`, {
+      const res = await githubRequest('DELETE', `/repos/${owner}/${repo}/contents/${encodePath(p)}`, {
         message,
         branch,
         sha,
       });
       if (res.status >= 400) throw new Error(`GitHub error ${res.status}: ${JSON.stringify(res.body)}`);
-      return { deleted: path };
+      return { deleted: p };
     },
   },
   {
@@ -545,9 +563,13 @@ const TOOLS = [
 // HTTP helpers
 // ---------------------------------------------------------------------------
 
-function sendJson(res, status, obj) {
+function sendJson(res, status, obj, extraHeaders) {
   const body = JSON.stringify(obj);
-  res.writeHead(status, { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) });
+  res.writeHead(status, {
+    'Content-Type': 'application/json',
+    'Content-Length': Buffer.byteLength(body),
+    ...(extraHeaders || {}),
+  });
   res.end(body);
 }
 
@@ -855,7 +877,19 @@ const server = http.createServer(async (req, res) => {
 
   try {
     if (url.pathname === '/health' && req.method === 'GET') {
-      sendJson(res, 200, { status: 'ok' });
+      // CORS enabled so the /status.html page (or any browser page) can read
+      // this. It returns no repo data or secrets, so an open CORS policy
+      // here is safe.
+      sendJson(res, 200, { status: 'ok' }, { 'Access-Control-Allow-Origin': '*' });
+      return;
+    }
+    if (url.pathname === '/status.html' && req.method === 'GET') {
+      if (!STATUS_HTML) {
+        sendJson(res, 404, { error: 'not_found' });
+        return;
+      }
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Content-Length': Buffer.byteLength(STATUS_HTML) });
+      res.end(STATUS_HTML);
       return;
     }
     if (url.pathname === '/.well-known/oauth-authorization-server' && req.method === 'GET') {
