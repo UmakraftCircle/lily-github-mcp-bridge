@@ -1,0 +1,212 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>lily-github-mcp-bridge · Status</title>
+<style>
+  :root {
+    --bg: #f6f7f9;
+    --panel: #ffffff;
+    --text: #1a1c20;
+    --muted: #6b7280;
+    --border: #e5e7eb;
+    --accent: #4f46e5;
+    --ok: #16a34a;
+    --bad: #dc2626;
+    --pending: #d97706;
+    --mono: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+    box-sizing: border-box;
+    padding-top: env(safe-area-inset-top, 0px);
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #0f1115;
+      --panel: #171a21;
+      --text: #e6e8eb;
+      --muted: #8b92a0;
+      --border: #262b33;
+      --accent: #818cf8;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #0f1115;
+    --panel: #171a21;
+    --text: #e6e8eb;
+    --muted: #8b92a0;
+    --border: #262b33;
+    --accent: #818cf8;
+  }
+  html { scroll-padding-top: env(safe-area-inset-top, 0px); }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    min-height: 100%;
+    display: flex;
+    justify-content: center;
+    padding: 32px 16px 48px;
+  }
+  .card {
+    width: 100%;
+    max-width: 640px;
+  }
+  header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    margin-bottom: 20px;
+    flex-wrap: wrap;
+  }
+  h1 {
+    font-size: 1.15rem;
+    margin: 0;
+    letter-spacing: -0.01em;
+  }
+  .sub { color: var(--muted); font-size: 0.85rem; margin-top: 2px; }
+  .badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 6px 12px;
+    border-radius: 999px;
+    font-size: 0.85rem;
+    font-weight: 600;
+    border: 1px solid var(--border);
+    background: var(--panel);
+    white-space: nowrap;
+  }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--pending); flex: none; }
+  .dot.ok { background: var(--ok); }
+  .dot.bad { background: var(--bad); }
+  .panel {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    padding: 16px;
+    margin-bottom: 16px;
+  }
+  .panel h2 {
+    font-size: 0.8rem;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--muted);
+    margin: 0 0 10px;
+  }
+  .log {
+    font-family: var(--mono);
+    font-size: 0.82rem;
+    line-height: 1.6;
+    max-height: 260px;
+    overflow-y: auto;
+    overflow-x: auto;
+  }
+  .log-line { white-space: pre-wrap; word-break: break-word; }
+  .log-line .t { color: var(--muted); }
+  .log-line.ok { color: var(--ok); }
+  .log-line.bad { color: var(--bad); }
+  .log-line.info { color: var(--text); }
+  .row { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+  button {
+    appearance: none;
+    border: 1px solid var(--border);
+    background: var(--panel);
+    color: var(--text);
+    padding: 8px 14px;
+    border-radius: 10px;
+    font-size: 0.85rem;
+    cursor: pointer;
+  }
+  button:hover { border-color: var(--accent); color: var(--accent); }
+  button:disabled { opacity: 0.5; cursor: default; }
+  .note {
+    color: var(--muted);
+    font-size: 0.78rem;
+    line-height: 1.5;
+    margin-top: 6px;
+  }
+  a { color: var(--accent); }
+</style>
+</head>
+<body>
+<div class="card">
+  <header>
+    <div>
+      <h1>lily-github-mcp-bridge</h1>
+      <div class="sub">Connection status — no source or file contents shown here</div>
+    </div>
+    <div class="badge"><span class="dot" id="statusDot"></span><span id="statusText">Checking…</span></div>
+  </header>
+
+  <div class="panel">
+    <div class="row">
+      <h2 style="margin:0;">Connection log</h2>
+      <button id="recheckBtn">Recheck</button>
+    </div>
+    <div class="log" id="log"></div>
+    <div class="note">
+      Pings the bridge's public <code>/health</code> endpoint only. It doesn't call <code>/mcp</code>,
+      doesn't send any credentials, and never reads or displays repository content.
+    </div>
+  </div>
+</div>
+
+<script>
+  const BASE = "https://lily-github-mcp-bridge.onrender.com";
+  const logEl = document.getElementById("log");
+  const dot = document.getElementById("statusDot");
+  const statusText = document.getElementById("statusText");
+  const btn = document.getElementById("recheckBtn");
+
+  function stamp() {
+    return new Date().toLocaleTimeString([], { hour12: false });
+  }
+
+  function line(kind, text) {
+    const el = document.createElement("div");
+    el.className = "log-line " + kind;
+    el.textContent = `[${stamp()}] ${text}`;
+    logEl.appendChild(el);
+    logEl.scrollTop = logEl.scrollHeight;
+  }
+
+  function setStatus(kind, text) {
+    dot.className = "dot" + (kind === "ok" ? " ok" : kind === "bad" ? " bad" : "");
+    statusText.textContent = text;
+  }
+
+  async function check() {
+    btn.disabled = true;
+    setStatus("pending", "Checking…");
+    line("info", `GET ${BASE}/health`);
+    try {
+      const start = performance.now();
+      const res = await fetch(BASE + "/health", { method: "GET" });
+      const ms = Math.round(performance.now() - start);
+      if (res.ok) {
+        let body = "";
+        try { body = JSON.stringify(await res.json()); } catch (e) {}
+        line("ok", `${res.status} OK in ${ms}ms ${body}`);
+        setStatus("ok", "Connected");
+      } else {
+        line("bad", `HTTP ${res.status} in ${ms}ms`);
+        setStatus("bad", "Unreachable");
+      }
+    } catch (err) {
+      line("bad", `Request failed: ${err.message}`);
+      line("info", "This can happen if the browser blocks the cross-origin request, or the service is asleep and waking up — try Recheck again in a few seconds.");
+      setStatus("bad", "Unreachable");
+    } finally {
+      btn.disabled = false;
+    }
+  }
+
+  btn.addEventListener("click", check);
+  check();
+</script>
+</body>
+</html>
