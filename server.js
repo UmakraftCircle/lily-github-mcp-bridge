@@ -10,6 +10,9 @@
  * - OAuth 2.0 (authorization-code style) in front of the MCP endpoint,
  *   gated by an admin secret (MCP_ADMIN_SECRET) you set as an env var.
  *   This satisfies Claude.ai's requirement that custom connectors use OAuth.
+ * - Access tokens last 1 hour and are renewed automatically via a
+ *   stateless 30-day refresh token, so the connector doesn't need
+ *   re-authorizing every hour (and survives server restarts).
  * - The actual GitHub PAT (GITHUB_TOKEN) never leaves this server or touches
  *   Claude / Anthropic infrastructure. It's used only for outbound calls to
  *   api.github.com.
@@ -20,11 +23,18 @@
  * Required env vars:
  *   GITHUB_TOKEN     - a GitHub PAT (fine-grained, scoped narrowly is best)
  *   MCP_ADMIN_SECRET - a long random string; acts as the password gating
- *                      the OAuth /authorize page and signs issued tokens
+ *                      the OAuth /authorize page
  *   MCP_BASE_URL     - the public HTTPS URL this server is reachable at,
  *                      e.g. https://your-domain.com  (no trailing slash)
  *   ALLOWED_REPOS    - comma-separated "owner/repo" list, e.g.
  *                      "UmakraftCircle/DmLilyAi"
+ *
+ * Optional env vars:
+ *   MCP_JWT_SECRET   - a separate long random string used to sign tokens and
+ *                      client IDs. Recommended, so the login password and the
+ *                      signing key aren't the same value. Falls back to
+ *                      MCP_ADMIN_SECRET if unset. Changing it invalidates
+ *                      all issued tokens (you'll need to reconnect).
  *
  * Run:
  *   GITHUB_TOKEN=ghp_xxx MCP_ADMIN_SECRET=xxx MCP_BASE_URL=https://your.host \
@@ -48,6 +58,7 @@ const { URL } = require('url');
 const PORT = process.env.PORT || 3232;
 const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
 const ADMIN_SECRET = process.env.MCP_ADMIN_SECRET;
+const JWT_SECRET = process.env.MCP_JWT_SECRET || ADMIN_SECRET;
 const BASE_URL = (process.env.MCP_BASE_URL || '').replace(/\/$/, '');
 const ALLOWED_REPOS = new Set(
   (process.env.ALLOWED_REPOS || '')
@@ -55,6 +66,9 @@ const ALLOWED_REPOS = new Set(
     .map((s) => s.trim())
     .filter(Boolean)
 );
+
+const ACCESS_TOKEN_TTL_S = 60 * 60; // 1 hour
+const REFRESH_TOKEN_TTL_S = 60 * 60 * 24 * 30; // 30 days
 
 if (!GITHUB_TOKEN) {
   console.error('FATAL: GITHUB_TOKEN env var is required.');
@@ -72,16 +86,26 @@ if (ALLOWED_REPOS.size === 0) {
   console.error('FATAL: ALLOWED_REPOS env var is required, e.g. "owner/repo,owner/repo2".');
   process.exit(1);
 }
+if (!process.env.MCP_JWT_SECRET) {
+  console.warn('WARN: MCP_JWT_SECRET is not set; signing tokens with MCP_ADMIN_SECRET. Set a separate value for better isolation.');
+}
 
 // In-memory store for OAuth authorization codes (short-lived, single-use).
 // Fine for a single-instance bridge server; not meant to scale horizontally.
 const pendingCodes = new Map(); // code -> { expiresAt, codeChallenge, codeChallengeMethod, clientId }
 
-// In-memory store for dynamically registered OAuth clients (RFC 7591).
-// claude.ai has no pre-shared client_id for a server it's never seen before,
-// so it registers itself here first, then uses the returned client_id in
-// the authorization-code flow. No client_secret is required (public client).
-const registeredClients = new Map(); // client_id -> { redirectUris }
+// ---------------------------------------------------------------------------
+// Small crypto helpers
+// ---------------------------------------------------------------------------
+
+// Constant-time string comparison. Both sides are hashed first so the inputs
+// are always the same length (timingSafeEqual throws on length mismatch and
+// an early length check would leak the secret's length).
+function safeEqual(a, b) {
+  const ha = crypto.createHash('sha256').update(String(a)).digest();
+  const hb = crypto.createHash('sha256').update(String(b)).digest();
+  return crypto.timingSafeEqual(ha, hb);
+}
 
 // ---------------------------------------------------------------------------
 // Tiny JWT (HS256) implementation, no external deps
@@ -111,24 +135,135 @@ function signJwt(payload, secret, expiresInSeconds) {
   return `${headerB64}.${payloadB64}.${signature}`;
 }
 
+// Returns the payload for a valid, unexpired token, or null for anything
+// else (malformed, bad signature, expired). Never throws.
 function verifyJwt(token, secret) {
-  const parts = token.split('.');
-  if (parts.length !== 3) return null;
-  const [headerB64, payloadB64, signature] = parts;
-  const expected = crypto
-    .createHmac('sha256', secret)
-    .update(`${headerB64}.${payloadB64}`)
-    .digest('base64')
-    .replace(/\+/g, '-')
-    .replace(/\//g, '_')
-    .replace(/=+$/, '');
-  if (!crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(expected))) {
+  try {
+    const parts = String(token).split('.');
+    if (parts.length !== 3) return null;
+    const [headerB64, payloadB64, signature] = parts;
+    const expected = crypto
+      .createHmac('sha256', secret)
+      .update(`${headerB64}.${payloadB64}`)
+      .digest('base64')
+      .replace(/\+/g, '-')
+      .replace(/\//g, '_')
+      .replace(/=+$/, '');
+    if (!safeEqual(signature, expected)) return null;
+    const payload = JSON.parse(Buffer.from(payloadB64, 'base64').toString('utf8'));
+    if (!payload || typeof payload !== 'object') return null;
+    if (!payload.exp || Math.floor(Date.now() / 1000) > payload.exp) return null;
+    return payload;
+  } catch (e) {
     return null;
   }
-  const payload = JSON.parse(Buffer.from(payloadB64, 'base64').toString('utf8'));
-  if (payload.exp && Math.floor(Date.now() / 1000) > payload.exp) return null;
-  return payload;
 }
+
+function issueTokens() {
+  return {
+    access_token: signJwt({ sub: 'lily-mcp-user', typ: 'access' }, JWT_SECRET, ACCESS_TOKEN_TTL_S),
+    token_type: 'Bearer',
+    expires_in: ACCESS_TOKEN_TTL_S,
+    refresh_token: signJwt({ sub: 'lily-mcp-user', typ: 'refresh' }, JWT_SECRET, REFRESH_TOKEN_TTL_S),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Stateless OAuth client IDs (RFC 7591 dynamic registration)
+//
+// The client_id embeds the registered redirect URIs and is HMAC-signed, so we
+// can validate redirect_uri on /authorize without keeping registrations in
+// memory (which a free-tier restart would wipe out).
+// ---------------------------------------------------------------------------
+
+function signClientPayload(p64) {
+  return crypto.createHmac('sha256', JWT_SECRET).update(`client.${p64}`).digest('base64url');
+}
+
+function makeClientId(redirectUris) {
+  const p64 = base64url(JSON.stringify({ ru: redirectUris }));
+  return `${p64}.${signClientPayload(p64)}`;
+}
+
+function parseClientId(clientId) {
+  try {
+    const parts = String(clientId).split('.');
+    if (parts.length !== 2) return null;
+    const [p64, sig] = parts;
+    if (!p64 || !sig || !safeEqual(sig, signClientPayload(p64))) return null;
+    const p = JSON.parse(Buffer.from(p64, 'base64url').toString('utf8'));
+    return p && Array.isArray(p.ru) ? { redirectUris: p.ru } : null;
+  } catch (e) {
+    return null;
+  }
+}
+
+// Returns an error string, or null if the client + redirect URI are valid.
+function validateAuthRequest(clientId, redirectUri) {
+  const client = parseClientId(clientId);
+  if (!client) return 'unknown_client';
+  if (!redirectUri || !client.redirectUris.includes(redirectUri)) return 'redirect_uri_mismatch';
+  return null;
+}
+
+function isAcceptableRedirectUri(uri) {
+  try {
+    const u = new URL(uri);
+    if (u.protocol === 'https:') return true;
+    // Allow loopback http for native/desktop MCP clients.
+    return u.protocol === 'http:' && (u.hostname === 'localhost' || u.hostname === '127.0.0.1' || u.hostname === '[::1]');
+  } catch (e) {
+    return false;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Brute-force protection for /authorize
+// ---------------------------------------------------------------------------
+
+const AUTH_WINDOW_MS = 15 * 60 * 1000;
+const AUTH_MAX_FAILS_PER_IP = 5;
+const AUTH_MAX_FAILS_GLOBAL = 20; // backstop in case the client IP can be spoofed
+const authFailures = new Map(); // ip -> [timestamps]
+let globalAuthFailures = [];
+
+function clientIp(req) {
+  // Behind a reverse proxy the rightmost X-Forwarded-For entry is the one the
+  // proxy itself appended; earlier entries can be forged by the client.
+  const xff = String(req.headers['x-forwarded-for'] || '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+  return xff.length ? xff[xff.length - 1] : (req.socket && req.socket.remoteAddress) || 'unknown';
+}
+
+function recent(list) {
+  const cutoff = Date.now() - AUTH_WINDOW_MS;
+  return list.filter((t) => t > cutoff);
+}
+
+function authLockedOut(ip) {
+  globalAuthFailures = recent(globalAuthFailures);
+  const mine = recent(authFailures.get(ip) || []);
+  if (mine.length) authFailures.set(ip, mine);
+  else authFailures.delete(ip);
+  return mine.length >= AUTH_MAX_FAILS_PER_IP || globalAuthFailures.length >= AUTH_MAX_FAILS_GLOBAL;
+}
+
+function recordAuthFailure(ip) {
+  const now = Date.now();
+  authFailures.set(ip, [...recent(authFailures.get(ip) || []), now]);
+  globalAuthFailures.push(now);
+}
+
+// Periodically drop stale entries so the map can't grow without bound.
+setInterval(() => {
+  for (const [ip, list] of authFailures) {
+    const r = recent(list);
+    if (r.length) authFailures.set(ip, r);
+    else authFailures.delete(ip);
+  }
+}, AUTH_WINDOW_MS).unref();
 
 // ---------------------------------------------------------------------------
 // GitHub REST API helper
@@ -442,7 +577,7 @@ function handleAuthServerMetadata(req, res) {
     token_endpoint: `${BASE_URL}/token`,
     registration_endpoint: `${BASE_URL}/register`,
     response_types_supported: ['code'],
-    grant_types_supported: ['authorization_code'],
+    grant_types_supported: ['authorization_code', 'refresh_token'],
     code_challenge_methods_supported: ['S256', 'plain'],
     token_endpoint_auth_methods_supported: ['none', 'client_secret_post'],
   });
@@ -460,9 +595,9 @@ function handleProtectedResourceMetadata(req, res) {
 
 // RFC 7591 - Dynamic Client Registration. claude.ai has no pre-shared
 // client_id for a server it's never seen before, so it registers itself
-// here first. We accept any registration and hand back a generated
-// client_id; no client_secret is issued since this is a public client
-// using PKCE.
+// here first. The returned client_id is a signed token that embeds the
+// registered redirect URIs (see makeClientId); no client_secret is issued
+// since this is a public client using PKCE.
 async function handleRegister(req, res) {
   let payload;
   try {
@@ -472,16 +607,25 @@ async function handleRegister(req, res) {
     return;
   }
 
-  const clientId = crypto.randomBytes(16).toString('hex');
-  registeredClients.set(clientId, {
-    redirectUris: Array.isArray(payload.redirect_uris) ? payload.redirect_uris : [],
-  });
+  const uris = payload && payload.redirect_uris;
+  if (
+    !Array.isArray(uris) ||
+    uris.length === 0 ||
+    uris.length > 10 ||
+    !uris.every((u) => typeof u === 'string' && isAcceptableRedirectUri(u))
+  ) {
+    sendJson(res, 400, {
+      error: 'invalid_redirect_uri',
+      error_description: 'redirect_uris must be 1-10 https (or loopback http) URLs.',
+    });
+    return;
+  }
 
   sendJson(res, 201, {
-    client_id: clientId,
-    redirect_uris: payload.redirect_uris || [],
+    client_id: makeClientId(uris),
+    redirect_uris: uris,
     token_endpoint_auth_method: 'none',
-    grant_types: ['authorization_code'],
+    grant_types: ['authorization_code', 'refresh_token'],
     response_types: ['code'],
   });
 }
@@ -492,6 +636,14 @@ function handleAuthorizeGet(req, res, query) {
   const clientId = query.get('client_id') || '';
   const codeChallenge = query.get('code_challenge') || '';
   const codeChallengeMethod = query.get('code_challenge_method') || '';
+
+  // Reject bad requests before ever showing the password form.
+  const invalid = validateAuthRequest(clientId, redirectUri);
+  if (invalid) {
+    sendJson(res, 400, { error: 'invalid_request', error_description: invalid });
+    return;
+  }
+
   const html = `<!doctype html>
 <html><head><meta charset="utf-8"><title>lily-github-mcp-bridge</title>
 <style>body{font-family:system-ui,sans-serif;max-width:420px;margin:80px auto;padding:0 16px}
@@ -519,23 +671,34 @@ function escapeHtml(s) {
 }
 
 async function handleAuthorizePost(req, res) {
+  const ip = clientIp(req);
+  if (authLockedOut(ip)) {
+    res.writeHead(429, { 'Content-Type': 'application/json', 'Retry-After': String(Math.ceil(AUTH_WINDOW_MS / 1000)) });
+    res.end(JSON.stringify({ error: 'too_many_attempts' }));
+    return;
+  }
+
   const raw = await readBody(req);
   const params = new URLSearchParams(raw);
-  const secret = params.get('secret');
-  const redirectUri = params.get('redirect_uri');
+  const secret = params.get('secret') || '';
+  const redirectUri = params.get('redirect_uri') || '';
   const state = params.get('state') || '';
   const clientId = params.get('client_id') || '';
   const codeChallenge = params.get('code_challenge') || '';
   const codeChallengeMethod = params.get('code_challenge_method') || 'plain';
 
-  if (secret !== ADMIN_SECRET) {
+  const invalid = validateAuthRequest(clientId, redirectUri);
+  if (invalid) {
+    sendJson(res, 400, { error: 'invalid_request', error_description: invalid });
+    return;
+  }
+
+  if (!safeEqual(secret, ADMIN_SECRET)) {
+    recordAuthFailure(ip);
     sendJson(res, 401, { error: 'invalid_secret' });
     return;
   }
-  if (!redirectUri) {
-    sendJson(res, 400, { error: 'missing_redirect_uri' });
-    return;
-  }
+  authFailures.delete(ip);
 
   const code = crypto.randomBytes(24).toString('hex');
   pendingCodes.set(code, {
@@ -558,16 +721,26 @@ function verifyPkce(entry, codeVerifier) {
   if (!codeVerifier) return false;
   if (entry.codeChallengeMethod === 'S256') {
     const hash = crypto.createHash('sha256').update(codeVerifier).digest('base64url');
-    return hash === entry.codeChallenge;
+    return safeEqual(hash, entry.codeChallenge);
   }
   // 'plain'
-  return codeVerifier === entry.codeChallenge;
+  return safeEqual(codeVerifier, entry.codeChallenge);
 }
 
 async function handleToken(req, res) {
   const raw = await readBody(req);
   const params = new URLSearchParams(raw);
   const grantType = params.get('grant_type');
+
+  if (grantType === 'refresh_token') {
+    const claims = verifyJwt(params.get('refresh_token') || '', JWT_SECRET);
+    if (!claims || claims.typ !== 'refresh') {
+      sendJson(res, 400, { error: 'invalid_grant' });
+      return;
+    }
+    sendJson(res, 200, issueTokens());
+    return;
+  }
 
   if (grantType !== 'authorization_code') {
     sendJson(res, 400, { error: 'unsupported_grant_type' });
@@ -589,12 +762,7 @@ async function handleToken(req, res) {
 
   pendingCodes.delete(code); // single-use
 
-  const accessToken = signJwt({ sub: 'lily-mcp-user' }, ADMIN_SECRET, 60 * 60); // 1 hour
-  sendJson(res, 200, {
-    access_token: accessToken,
-    token_type: 'Bearer',
-    expires_in: 3600,
-  });
+  sendJson(res, 200, issueTokens());
 }
 
 // ---------------------------------------------------------------------------
@@ -603,7 +771,9 @@ async function handleToken(req, res) {
 
 async function handleMcp(req, res) {
   const token = getBearerToken(req);
-  if (!token || !verifyJwt(token, ADMIN_SECRET)) {
+  const claims = token ? verifyJwt(token, JWT_SECRET) : null;
+  // Refresh tokens must never be usable as access tokens.
+  if (!claims || claims.typ === 'refresh') {
     // Point the client at our protected-resource metadata so it knows
     // where to go to authenticate (required for MCP OAuth discovery).
     res.writeHead(401, {
@@ -632,7 +802,7 @@ async function handleMcp(req, res) {
         result: {
           protocolVersion: '2024-11-05',
           capabilities: { tools: {} },
-          serverInfo: { name: 'lily-github-mcp-bridge', version: '1.0.0' },
+          serverInfo: { name: 'lily-github-mcp-bridge', version: '1.1.0' },
         },
       });
       return;
