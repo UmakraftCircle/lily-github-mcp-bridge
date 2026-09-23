@@ -693,3 +693,27 @@ server.listen(PORT, () => {
   console.log(`Allowed repos: ${[...ALLOWED_REPOS].join(', ')}`);
   console.log(`MCP endpoint (once deployed): ${BASE_URL}/mcp`);
 });
+
+// ---------------------------------------------------------------------------
+// Self-ping — keeps a Render free-tier web service from spinning down after
+// its inactivity timeout. Hits our own public /health endpoint on a timer.
+// Set SELF_PING=false to disable (e.g. if you're on a paid "Always On" plan).
+// ---------------------------------------------------------------------------
+
+const SELF_PING_INTERVAL_MS = Number(process.env.SELF_PING_INTERVAL_MS || 10 * 60 * 1000); // 10 min
+
+function selfPing() {
+  https
+    .get(`${BASE_URL}/health`, (res) => {
+      res.resume(); // drain response body, don't hold the socket open
+      console.log(`[self-ping] ${res.statusCode} at ${new Date().toISOString()}`);
+    })
+    .on('error', (err) => {
+      console.error(`[self-ping] failed: ${err.message}`);
+    });
+}
+
+if (process.env.SELF_PING !== 'false') {
+  setInterval(selfPing, SELF_PING_INTERVAL_MS).unref();
+  console.log(`Self-ping enabled: pinging ${BASE_URL}/health every ${SELF_PING_INTERVAL_MS / 1000}s`);
+}
