@@ -184,6 +184,18 @@ function assertRepoAllowed(owner, repo) {
   }
 }
 
+// Encode a repo file path for use in a GitHub contents API URL. Each segment
+// is encoded on its own so "/" separators are preserved (encoding the whole
+// path would turn "src/foo.js" into "src%2Ffoo.js", which GitHub rejects).
+// Leading/trailing slashes are stripped; an empty path means the repo root.
+function encodePath(path) {
+  return String(path || '')
+    .split('/')
+    .filter(Boolean)
+    .map(encodeURIComponent)
+    .join('/');
+}
+
 // ---------------------------------------------------------------------------
 // Tool implementations
 // ---------------------------------------------------------------------------
@@ -191,13 +203,14 @@ function assertRepoAllowed(owner, repo) {
 const TOOLS = [
   {
     name: 'get_file_contents',
-    description: 'Get the contents and blob SHA of a file in an allowed repo.',
+    description:
+      'Get the contents and blob SHA of a file in an allowed repo. If the path is a directory (or empty for the repo root), returns a listing of its entries instead.',
     inputSchema: {
       type: 'object',
       properties: {
         owner: { type: 'string' },
         repo: { type: 'string' },
-        path: { type: 'string' },
+        path: { type: 'string', description: 'File or directory path. Use an empty string for the repo root.' },
         ref: { type: 'string', description: 'Branch, tag or SHA. Defaults to the repo default branch.' },
       },
       required: ['owner', 'repo', 'path'],
@@ -205,8 +218,24 @@ const TOOLS = [
     handler: async ({ owner, repo, path, ref }) => {
       assertRepoAllowed(owner, repo);
       const q = ref ? `?ref=${encodeURIComponent(ref)}` : '';
-      const res = await githubRequest('GET', `/repos/${owner}/${repo}/contents/${encodeURIComponent(path)}${q}`);
+      const res = await githubRequest('GET', `/repos/${owner}/${repo}/contents/${encodePath(path)}${q}`);
       if (res.status >= 400) throw new Error(`GitHub error ${res.status}: ${JSON.stringify(res.body)}`);
+
+      // Directory: GitHub returns an array of entries.
+      if (Array.isArray(res.body)) {
+        return {
+          path: path || '/',
+          type: 'dir',
+          entries: res.body.map((e) => ({
+            name: e.name,
+            path: e.path,
+            type: e.type,
+            sha: e.sha,
+            size: e.size,
+          })),
+        };
+      }
+
       const content = res.body.encoding === 'base64' ? Buffer.from(res.body.content, 'base64').toString('utf8') : res.body.content;
       return { sha: res.body.sha, path: res.body.path, content };
     },
@@ -235,7 +264,7 @@ const TOOLS = [
         content: Buffer.from(content, 'utf8').toString('base64'),
         ...(sha ? { sha } : {}),
       };
-      const res = await githubRequest('PUT', `/repos/${owner}/${repo}/contents/${encodeURIComponent(path)}`, body);
+      const res = await githubRequest('PUT', `/repos/${owner}/${repo}/contents/${encodePath(path)}`, body);
       if (res.status >= 400) throw new Error(`GitHub error ${res.status}: ${JSON.stringify(res.body)}`);
       return { commit: res.body.commit && res.body.commit.sha, path };
     },
@@ -257,7 +286,7 @@ const TOOLS = [
     },
     handler: async ({ owner, repo, path, message, branch, sha }) => {
       assertRepoAllowed(owner, repo);
-      const res = await githubRequest('DELETE', `/repos/${owner}/${repo}/contents/${encodeURIComponent(path)}`, {
+      const res = await githubRequest('DELETE', `/repos/${owner}/${repo}/contents/${encodePath(path)}`, {
         message,
         branch,
         sha,
