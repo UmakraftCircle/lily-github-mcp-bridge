@@ -20,8 +20,8 @@
  *   list, with "owner/*" and "*" wildcards supported) so the bridge can't
  *   touch anything beyond what you intend, even if the PAT itself has
  *   broader scope.
- * - GET /status.html serves a small static status page (no auth required,
- *   read-only, doesn't expose repo contents) that pings /health.
+ * - GET / and GET /status.html serve a small static status page (no auth
+ *   required, read-only, doesn't expose repo contents) that pings /health.
  *
  * Required env vars:
  *   GITHUB_TOKEN     - a GitHub PAT (fine-grained, scoped narrowly is best)
@@ -395,7 +395,7 @@ const TOOLS = [
   },
   {
     name: 'create_or_update_file',
-    description: 'Create or update a single file with one commit. Pass sha when updating an existing file.',
+    description: 'Create or update a single file with one commit. Pass sha when overwriting an existing file.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -883,7 +883,7 @@ const server = http.createServer(async (req, res) => {
       sendJson(res, 200, { status: 'ok' }, { 'Access-Control-Allow-Origin': '*' });
       return;
     }
-    if (url.pathname === '/status.html' && req.method === 'GET') {
+    if ((url.pathname === '/' || url.pathname === '/status.html') && req.method === 'GET') {
       if (!STATUS_HTML) {
         sendJson(res, 404, { error: 'not_found' });
         return;
