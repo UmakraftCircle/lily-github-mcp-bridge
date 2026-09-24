@@ -265,14 +265,14 @@ function isAcceptableRedirectUri(uri) {
 }
 
 // ---------------------------------------------------------------------------
-// Brute-force protection for /authorize
+// Rate limiting for unauthenticated POST endpoints (/authorize, /register,
+// /token). Each endpoint gets its own bucket (separate per-IP and global
+// counters) via makeRateLimiter, so hammering one doesn't lock out another.
+// In-memory only: counters reset on a process restart (e.g. a Render
+// free-tier spin-down/up cycle). That's an accepted tradeoff for a
+// single-instance bridge with no external store — it bounds abuse within a
+// running process without adding a database dependency.
 // ---------------------------------------------------------------------------
-
-const AUTH_WINDOW_MS = 15 * 60 * 1000;
-const AUTH_MAX_FAILS_PER_IP = 5;
-const AUTH_MAX_FAILS_GLOBAL = 20; // backstop in case the client IP can be spoofed
-const authFailures = new Map(); // ip -> [timestamps]
-let globalAuthFailures = [];
 
 function clientIp(req) {
   // Behind a reverse proxy the rightmost X-Forwarded-For entry is the one the
@@ -284,33 +284,50 @@ function clientIp(req) {
   return xff.length ? xff[xff.length - 1] : (req.socket && req.socket.remoteAddress) || 'unknown';
 }
 
-function recent(list) {
-  const cutoff = Date.now() - AUTH_WINDOW_MS;
-  return list.filter((t) => t > cutoff);
-}
+function makeRateLimiter({ windowMs, maxPerIp, maxGlobal }) {
+  const perIp = new Map(); // ip -> [timestamps]
+  let global = [];
 
-function authLockedOut(ip) {
-  globalAuthFailures = recent(globalAuthFailures);
-  const mine = recent(authFailures.get(ip) || []);
-  if (mine.length) authFailures.set(ip, mine);
-  else authFailures.delete(ip);
-  return mine.length >= AUTH_MAX_FAILS_PER_IP || globalAuthFailures.length >= AUTH_MAX_FAILS_GLOBAL;
-}
-
-function recordAuthFailure(ip) {
-  const now = Date.now();
-  authFailures.set(ip, [...recent(authFailures.get(ip) || []), now]);
-  globalAuthFailures.push(now);
-}
-
-// Periodically drop stale entries so the map can't grow without bound.
-setInterval(() => {
-  for (const [ip, list] of authFailures) {
-    const r = recent(list);
-    if (r.length) authFailures.set(ip, r);
-    else authFailures.delete(ip);
+  function recent(list) {
+    const cutoff = Date.now() - windowMs;
+    return list.filter((t) => t > cutoff);
   }
-}, AUTH_WINDOW_MS).unref();
+
+  // Periodically drop stale entries so the map can't grow without bound.
+  setInterval(() => {
+    for (const [ip, list] of perIp) {
+      const r = recent(list);
+      if (r.length) perIp.set(ip, r);
+      else perIp.delete(ip);
+    }
+  }, windowMs).unref();
+
+  return {
+    lockedOut(ip) {
+      global = recent(global);
+      const mine = recent(perIp.get(ip) || []);
+      if (mine.length) perIp.set(ip, mine);
+      else perIp.delete(ip);
+      return mine.length >= maxPerIp || global.length >= maxGlobal;
+    },
+    recordFailure(ip) {
+      const now = Date.now();
+      perIp.set(ip, [...recent(perIp.get(ip) || []), now]);
+      global.push(now);
+    },
+    clear(ip) {
+      perIp.delete(ip);
+    },
+    windowMs,
+  };
+}
+
+// /authorize: keyed on wrong-secret attempts (existing behavior).
+const authorizeLimiter = makeRateLimiter({ windowMs: 15 * 60 * 1000, maxPerIp: 5, maxGlobal: 20 });
+// /register and /token: no "wrong password" concept, so every call counts —
+// these just cap raw request volume per IP to blunt automated abuse/spam.
+const registerLimiter = makeRateLimiter({ windowMs: 15 * 60 * 1000, maxPerIp: 20, maxGlobal: 100 });
+const tokenLimiter = makeRateLimiter({ windowMs: 15 * 60 * 1000, maxPerIp: 30, maxGlobal: 150 });
 
 // ---------------------------------------------------------------------------
 // GitHub REST API helper
@@ -668,6 +685,14 @@ function handleProtectedResourceMetadata(req, res) {
 // registered redirect URIs (see makeClientId); no client_secret is issued
 // since this is a public client using PKCE.
 async function handleRegister(req, res) {
+  const ip = clientIp(req);
+  if (registerLimiter.lockedOut(ip)) {
+    res.writeHead(429, { 'Content-Type': 'application/json', 'Retry-After': String(Math.ceil(registerLimiter.windowMs / 1000)) });
+    res.end(JSON.stringify({ error: 'too_many_requests' }));
+    return;
+  }
+  registerLimiter.recordFailure(ip); // every call counts toward the cap, not just failures
+
   let payload;
   try {
     payload = JSON.parse(await readBody(req));
@@ -751,8 +776,8 @@ function escapeHtml(s) {
 
 async function handleAuthorizePost(req, res) {
   const ip = clientIp(req);
-  if (authLockedOut(ip)) {
-    res.writeHead(429, { 'Content-Type': 'application/json', 'Retry-After': String(Math.ceil(AUTH_WINDOW_MS / 1000)) });
+  if (authorizeLimiter.lockedOut(ip)) {
+    res.writeHead(429, { 'Content-Type': 'application/json', 'Retry-After': String(Math.ceil(authorizeLimiter.windowMs / 1000)) });
     res.end(JSON.stringify({ error: 'too_many_attempts' }));
     return;
   }
@@ -773,11 +798,11 @@ async function handleAuthorizePost(req, res) {
   }
 
   if (!safeEqual(secret, ADMIN_SECRET)) {
-    recordAuthFailure(ip);
+    authorizeLimiter.recordFailure(ip);
     sendJson(res, 401, { error: 'invalid_secret' });
     return;
   }
-  authFailures.delete(ip);
+  authorizeLimiter.clear(ip);
 
   const code = crypto.randomBytes(24).toString('hex');
   pendingCodes.set(code, {
@@ -807,6 +832,14 @@ function verifyPkce(entry, codeVerifier) {
 }
 
 async function handleToken(req, res) {
+  const ip = clientIp(req);
+  if (tokenLimiter.lockedOut(ip)) {
+    res.writeHead(429, { 'Content-Type': 'application/json', 'Retry-After': String(Math.ceil(tokenLimiter.windowMs / 1000)) });
+    res.end(JSON.stringify({ error: 'too_many_requests' }));
+    return;
+  }
+  tokenLimiter.recordFailure(ip); // every call counts toward the cap, not just failures
+
   const raw = await readBody(req);
   const params = new URLSearchParams(raw);
   const grantType = params.get('grant_type');
@@ -903,14 +936,22 @@ async function handleMcp(req, res) {
         sendJson(res, 200, { jsonrpc: '2.0', id, error: { code: -32601, message: `Unknown tool: ${params.name}` } });
         return;
       }
+      const args = params.arguments || {};
+      // Not a persisted audit log (stdout only, subject to Render's log
+      // retention) but enough to answer "who touched what repo, and when" by
+      // grepping deploy logs after the fact.
+      const target = args.owner && args.repo ? `${args.owner}/${args.repo}` : '-';
+      const logLine = `[tools/call] ${new Date().toISOString()} ip=${clientIp(req)} tool=${params.name} repo=${target}`;
       try {
-        const result = await tool.handler(params.arguments || {});
+        const result = await tool.handler(args);
+        console.log(`${logLine} status=ok`);
         sendJson(res, 200, {
           jsonrpc: '2.0',
           id,
           result: { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] },
         });
       } catch (err) {
+        console.log(`${logLine} status=error message=${err.message}`);
         sendJson(res, 200, {
           jsonrpc: '2.0',
           id,
