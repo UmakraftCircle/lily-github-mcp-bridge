@@ -20,8 +20,8 @@
  *   list, with "owner/*" and "*" wildcards supported) so the bridge can't
  *   touch anything beyond what you intend, even if the PAT itself has
  *   broader scope.
- * - GET / and GET /status.html serve a small static status page (no auth
- *   required, read-only, doesn't expose repo contents) that pings /health.
+ * - GET /status.html serves a small static status page (no auth required,
+ *   read-only, doesn't expose repo contents) that pings /health.
  *
  * Required env vars:
  *   GITHUB_TOKEN     - a GitHub PAT (fine-grained, scoped narrowly is best)
@@ -40,6 +40,16 @@
  *                      signing key aren't the same value. Falls back to
  *                      MCP_ADMIN_SECRET if unset. Changing it invalidates
  *                      all issued tokens (you'll need to reconnect).
+ *   ALLOWED_REDIRECT_HOSTS - comma-separated list of hostnames (or parent
+ *                      domains) that an OAuth client is allowed to register
+ *                      a redirect_uri against, e.g. "claude.ai". Defaults to
+ *                      "claude.ai". Loopback (localhost/127.0.0.1) is always
+ *                      allowed for native/desktop MCP clients regardless of
+ *                      this setting. This exists so a stranger can't register
+ *                      a client_id pointing at their own domain and trick you
+ *                      into authorizing a token that gets redirected to them
+ *                      (consent phishing) — the /authorize page only ever
+ *                      hands out a code to a host on this list.
  *
  * Run:
  *   GITHUB_TOKEN=ghp_xxx MCP_ADMIN_SECRET=xxx MCP_BASE_URL=https://your.host \
@@ -71,6 +81,12 @@ const ALLOWED_REPOS = new Set(
   (process.env.ALLOWED_REPOS || '')
     .split(',')
     .map((s) => s.trim())
+    .filter(Boolean)
+);
+const ALLOWED_REDIRECT_HOSTS = new Set(
+  (process.env.ALLOWED_REDIRECT_HOSTS || 'claude.ai')
+    .split(',')
+    .map((s) => s.trim().toLowerCase())
     .filter(Boolean)
 );
 
@@ -227,9 +243,22 @@ function validateAuthRequest(clientId, redirectUri) {
 function isAcceptableRedirectUri(uri) {
   try {
     const u = new URL(uri);
-    if (u.protocol === 'https:') return true;
-    // Allow loopback http for native/desktop MCP clients.
-    return u.protocol === 'http:' && (u.hostname === 'localhost' || u.hostname === '127.0.0.1' || u.hostname === '[::1]');
+    if (u.protocol === 'http:') {
+      // Loopback http is always fine — only reachable from this machine,
+      // used by native/desktop MCP clients during local development.
+      return u.hostname === 'localhost' || u.hostname === '127.0.0.1' || u.hostname === '[::1]';
+    }
+    if (u.protocol !== 'https:') return false;
+    // https must target an explicitly allowed host (or a subdomain of one).
+    // This is what stops a stranger from registering a client_id whose
+    // redirect_uri points at a domain they control (consent phishing): even
+    // with a valid client_id + PKCE, /authorize will never hand out a code
+    // for a redirect host outside this list.
+    const host = u.hostname.toLowerCase();
+    for (const allowed of ALLOWED_REDIRECT_HOSTS) {
+      if (host === allowed || host.endsWith(`.${allowed}`)) return true;
+    }
+    return false;
   } catch (e) {
     return false;
   }
@@ -638,7 +667,7 @@ async function handleRegister(req, res) {
   ) {
     sendJson(res, 400, {
       error: 'invalid_redirect_uri',
-      error_description: 'redirect_uris must be 1-10 https (or loopback http) URLs.',
+      error_description: `redirect_uris must be 1-10 https URLs on an allowed host (${[...ALLOWED_REDIRECT_HOSTS].join(', ')}), or loopback http for local clients.`,
     });
     return;
   }
@@ -666,14 +695,24 @@ function handleAuthorizeGet(req, res, query) {
     return;
   }
 
+  // Safe: redirectUri already passed validateAuthRequest above, which
+  // confirms it's one of the client's registered (and host-allowlisted)
+  // URIs, so `new URL()` here won't throw and won't reflect anything
+  // outside what /register already accepted.
+  const redirectHost = new URL(redirectUri).host;
+
   const html = `<!doctype html>
 <html><head><meta charset="utf-8"><title>lily-github-mcp-bridge</title>
 <style>body{font-family:system-ui,sans-serif;max-width:420px;margin:80px auto;padding:0 16px}
 input{width:100%;padding:10px;margin:8px 0;box-sizing:border-box}
-button{padding:10px 16px;cursor:pointer}</style></head>
+button{padding:10px 16px;cursor:pointer}
+.dest{background:#f3f4f6;border:1px solid #d1d5db;border-radius:8px;padding:10px 12px;margin:16px 0;font-size:0.9rem;word-break:break-all}
+.dest b{display:block;margin-bottom:4px;font-size:1rem}
+.dest span{color:#6b7280}</style></head>
 <body>
 <h2>Authorize MCP access</h2>
-<p>Enter the admin secret to authorize this connection.</p>
+<p>An application is requesting access to this bridge. Check the destination below before entering the admin secret — if it's not what you expect, close this page.</p>
+<div class="dest"><b>${escapeHtml(redirectHost)}</b><span>${escapeHtml(redirectUri)}</span></div>
 <form method="POST" action="/authorize">
   <input type="hidden" name="redirect_uri" value="${escapeHtml(redirectUri)}">
   <input type="hidden" name="state" value="${escapeHtml(state)}">
