@@ -602,11 +602,29 @@ function sendJson(res, status, obj, extraHeaders) {
   res.end(body);
 }
 
+// Applies to every POST body this server reads, including the unauthenticated
+// /register, /authorize, and /token endpoints, so a flood of oversized
+// requests can't grow memory unbounded. None of our real payloads (OAuth
+// form posts, MCP tool calls, file contents for push_files) need anywhere
+// near this much; it's a generous ceiling, not a working limit.
+const MAX_BODY_BYTES = 2 * 1024 * 1024; // 2 MB
+
+class PayloadTooLargeError extends Error {}
+
 function readBody(req) {
   return new Promise((resolve, reject) => {
-    let data = '';
-    req.on('data', (chunk) => (data += chunk));
-    req.on('end', () => resolve(data));
+    let size = 0;
+    const chunks = [];
+    req.on('data', (chunk) => {
+      size += chunk.length;
+      if (size > MAX_BODY_BYTES) {
+        req.destroy();
+        reject(new PayloadTooLargeError('Request body too large'));
+        return;
+      }
+      chunks.push(chunk);
+    });
+    req.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
     req.on('error', reject);
   });
 }
@@ -849,6 +867,7 @@ async function handleMcp(req, res) {
   try {
     payload = JSON.parse(await readBody(req));
   } catch (e) {
+    if (e instanceof PayloadTooLargeError) throw e; // let the outer handler send a proper 413
     sendJson(res, 400, { jsonrpc: '2.0', error: { code: -32700, message: 'Parse error' }, id: null });
     return;
   }
@@ -961,6 +980,10 @@ const server = http.createServer(async (req, res) => {
     }
     sendJson(res, 404, { error: 'not_found' });
   } catch (err) {
+    if (err instanceof PayloadTooLargeError) {
+      sendJson(res, 413, { error: 'payload_too_large', message: `Request body exceeds ${MAX_BODY_BYTES} bytes.` });
+      return;
+    }
     sendJson(res, 500, { error: 'internal_error', message: err.message });
   }
 });
